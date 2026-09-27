@@ -1,10 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { createReport, observations, reports, stations } from './store.js';
+import { createReport, createSnapshot, findSnapshotByRequestKey, observations, reports, snapshots, stations, verifySnapshot } from './store.js';
 
 const ingestSchema = z.object({ stationId: z.string(), observedAt: z.string().datetime().optional(), samples: z.number().int().nonnegative(), sampleRateHz: z.number().positive(), peakAmplitude: z.number().nonnegative(), timingOffsetMs: z.number() });
 const reportSchema = z.object({ stationId: z.string(), windowStart: z.string().datetime(), windowEnd: z.string().datetime() });
+const snapshotSchema = z.object({ stationId: z.string(), windowStart: z.string().datetime(), windowEnd: z.string().datetime(), requestKey: z.string().min(1).max(128).optional() }).refine(value => value.windowStart <= value.windowEnd, { message: 'windowStart 必须早于或等于 windowEnd' });
 export async function registerRoutes(app: FastifyInstance) {
   app.get('/health', async () => ({ status: 'ok', service: 'seismic-station-quality-service', workflow: '接收台站数据 → 检测完整性 → 计算质量分 → 生成质量报告' }));
   app.get('/api/stations', async () => stations);
@@ -13,4 +14,14 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get('/api/observations', async (request) => { const query = request.query as { stationId?: string; minScore?: string }; return observations.filter(item => (!query.stationId || item.stationId === query.stationId) && (!query.minScore || item.qualityScore >= Number(query.minScore))); });
   app.post('/api/quality/reports/run', async (request, reply) => { const parsed = reportSchema.safeParse(request.body); if (!parsed.success) return reply.code(400).send({ error: '参数校验失败', details: parsed.error.flatten() }); if (!stations.some(item => item.id === parsed.data.stationId)) return reply.code(404).send({ error: '台站不存在' }); return reply.code(201).send(createReport(parsed.data.stationId, parsed.data.windowStart, parsed.data.windowEnd)); });
   app.get('/api/quality/reports', async (request) => { const query = request.query as { stationId?: string }; return reports.filter(item => !query.stationId || item.stationId === query.stationId); });
+  app.post('/api/quality/snapshots', async (request, reply) => {
+    const parsed = snapshotSchema.safeParse(request.body); if (!parsed.success) return reply.code(400).send({ error: '参数校验失败', details: parsed.error.flatten() });
+    const input = parsed.data; if (!stations.some(item => item.id === input.stationId)) return reply.code(404).send({ error: '台站不存在' });
+    const headerKey = request.headers['idempotency-key']; const requestKey = input.requestKey ?? (typeof headerKey === 'string' && headerKey.trim() ? headerKey.trim() : null);
+    if (requestKey) { const existing = findSnapshotByRequestKey(requestKey); if (existing) { const sameRequest = existing.stationId === input.stationId && existing.windowStart === input.windowStart && existing.windowEnd === input.windowEnd; if (!sameRequest) return reply.code(409).send({ error: 'requestKey 已被不同参数的快照使用', snapshotId: existing.id }); return reply.code(200).send(existing); } }
+    return reply.code(201).send(createSnapshot({ stationId: input.stationId, windowStart: input.windowStart, windowEnd: input.windowEnd, requestKey }));
+  });
+  app.get('/api/quality/snapshots', async (request) => { const query = request.query as { stationId?: string }; return snapshots.filter(item => !query.stationId || item.stationId === query.stationId).map(item => ({ id: item.id, stationId: item.stationId, windowStart: item.windowStart, windowEnd: item.windowEnd, status: item.status, createdAt: item.createdAt, summary: item.summary, checksum: item.checksum })); });
+  app.get('/api/quality/snapshots/:id', async (request, reply) => { const { id } = request.params as { id: string }; const snapshot = snapshots.find(item => item.id === id); if (!snapshot) return reply.code(404).send({ error: '快照不存在' }); return snapshot; });
+  app.get('/api/quality/snapshots/:id/verify', async (request, reply) => { const { id } = request.params as { id: string }; const snapshot = snapshots.find(item => item.id === id); if (!snapshot) return reply.code(404).send({ error: '快照不存在' }); return verifySnapshot(snapshot); });
 }
